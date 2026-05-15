@@ -7,6 +7,18 @@ import json, os, re, sys
 from collections import defaultdict
 from datetime import datetime
 
+# Pre-compiled regex patterns for performance
+RE_COMPILED = {
+    "frontmatter_key": re.compile(r"^(\w+):\s*(.*)$"),
+    "slug_mention": re.compile(r"(?:[`'\"]|/|[\b]){slug}(?:[`'\"]|/|[\b]|<)".replace("{slug}", r"([a-z][a-z0-9_-]{{4,30}})"), re.I),
+    "backtick_slug": re.compile(r"`([a-z][a-z0-9_-]{{4,30})`"),
+    "trigger": re.compile(r"\b(use when|trigger|activates|use this skill)\b", re.I),
+    "trigger_section": re.compile(r"(?:trigger|when to use|use when|activates)[\s:]*([^\n]+(?:\n(?!\n)[^\n]+){{0,5}})", re.I),
+    "protocol_style": re.compile(r"^#\s+/[a-z][a-z0-9_-]+\s*[-—]", re.M),
+    "meta_block": re.compile(r"metadata:\s*\{{([^}}]+)\}"),
+    "meta_kv": re.compile(r'"(\w+)":\s*"?([^"]+)"?'),
+}
+
 SKILLS_DIRS = [
     os.path.expanduser("~/.openclaw/workspace/skills"),
     os.path.expanduser("~/.openclaw/skills"),
@@ -42,6 +54,26 @@ def tag_skill(slug):
     return "general"
 
 
+def parse_frontmatter(content):
+    """Parse frontmatter from skill content.
+    
+    Returns (frontmatter_dict, body_str).
+    frontmatter is a dict of key->value from YAML frontmatter.
+    body is everything after the closing '---' delimiter.
+    """
+    frontmatter = {}
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        if len(parts) >= 2:
+            for line in parts[1].split("\n"):
+                m = RE_COMPILED["frontmatter_key"].match(line.strip())
+                if m:
+                    frontmatter[m.group(1)] = m.group(2).strip()
+            body = parts[2] if len(parts) > 2 else ""
+    return frontmatter, body
+
+
 def scan_all_skills():
     skills = {}
     all_slugs = set()
@@ -69,43 +101,39 @@ def scan_all_skills():
             with open(sk_path, encoding="utf-8", errors="ignore") as f:
                 content = f.read()
 
-            frontmatter = {}
-            body = content
-            if content.startswith("---"):
-                parts = content[3:].split("---", 2)
-                if len(parts) >= 2:
-                    for line in parts[1].split("\n"):
-                        m = re.match(r"^(\w+):\s*(.*)$", line.strip())
-                        if m:
-                            frontmatter[m.group(1)] = m.group(2).strip()
-                    body = parts[2] if len(parts) > 2 else ""
+            frontmatter, body = parse_frontmatter(content)
 
             # Extract ALL skill name mentions
             all_mentions = set()
             for other in all_slugs:
                 if other == slug:
                     continue
-                if re.search(r"(?:[`'\"]|/|\b)" + re.escape(other) + r"(?:[`'\"]|/|\b|<)", body, re.I):
+                pat = re.compile(
+                    r"(?:[`'\"]|/|[\b])" + re.escape(other) + r"(?:[`'\"]|/|[\b]|<)",
+                    re.I
+                )
+                if pat.search(body):
                     all_mentions.add(other)
 
             # Also find backtick-quoted slugs
-            for found in re.findall(r"`([a-z][a-z0-9_-]{4,30})`", body):
+            for found in RE_COMPILED["backtick_slug"].findall(body):
                 if found != slug and found in all_slugs:
                     all_mentions.add(found)
 
-            # Detect triggers
-            has_triggers = bool(re.search(r"\b(use when|trigger|activates|use this skill)\b", body, re.I))
-            trigger_section = re.search(r"(?:trigger|when to use|use when|activates)[\s:]*([^\n]+(?:\n(?!\n)[^\n]+){0,5})", body, re.I)
+            # Detect triggers — check both body and frontmatter description
+            desc = frontmatter.get("description", "")
+            has_triggers = bool(RE_COMPILED["trigger"].search(body) or RE_COMPILED["trigger"].search(desc))
+            trigger_section = RE_COMPILED["trigger_section"].search(body) or RE_COMPILED["trigger_section"].search(desc)
             trigger_text = trigger_section.group(1).strip()[:200] if trigger_section else ""
 
             # Protocol-style detection: starts with # /command or ## /command
-            is_protocol = bool(re.search(r"^#\s+/[a-z][a-z0-9_-]+\s*[-—]", body, re.M))
+            is_protocol = bool(RE_COMPILED["protocol_style"].search(body))
 
             # Metadata
             meta_block = {}
-            meta_m = re.search(r"metadata:\s*\{([^}]+)\}", content)
+            meta_m = RE_COMPILED["meta_block"].search(content)
             if meta_m:
-                for kv in re.findall(r'"(\w+)":\s*"?([^"]+)"?', meta_m.group(1)):
+                for kv in RE_COMPILED["meta_kv"].findall(meta_m.group(1)):
                     meta_block[kv[0]] = kv[1]
 
             # ClawHub origin data
@@ -116,6 +144,8 @@ def scan_all_skills():
                     with open(origin_path) as f:
                         origin = json.load(f)
                 except: pass
+
+            desc = frontmatter.get("description", "")
 
             skills[slug] = {
                 "path": sk_path,
@@ -129,6 +159,8 @@ def scan_all_skills():
                 "lines": content.count("\n"),
                 "origin": origin,
                 "category": tag_skill(slug),
+                "is_role_based": _is_role_based(desc),
+                "has_meaningful_desc": _has_meaningful_desc(desc, content.count("\n")),
             }
 
     # Resolve references
@@ -156,25 +188,60 @@ def classify_skills(skills):
     return core, bridge, leaf, isolated
 
 
+def _is_role_based(desc):
+    """Role-based agent: description starts with 'You are' and has a role name."""
+    stripped = desc.strip()
+    return stripped.startswith("You are") and len(stripped) > 20
+
+
+def _has_meaningful_desc(desc, body_lines):
+    """Has substantive content beyond role definition."""
+    if not desc or len(desc.strip()) < 15:
+        return False
+    # Penalize generic placeholder descriptions
+    placeholder_phrases = ["to be written", "tbd", "todo", "under development",
+                          "not yet implemented", "coming soon"]
+    desc_lower = desc.lower()
+    if any(p in desc_lower for p in placeholder_phrases):
+        return False
+    return True
+
+
+def _has_identity(skill_data):
+    """A skill has identity if it has any form of self-definition."""
+    if skill_data.get("has_triggers"):
+        return True
+    if skill_data.get("is_protocol"):
+        return True
+    desc = skill_data.get("frontmatter", {}).get("description", "")
+    if _is_role_based(desc):
+        return True
+    if _has_meaningful_desc(desc, skill_data.get("lines", 0)):
+        return True
+    return False
+
+
 def detect_orphans(skills):
+    """Detect skills with no trigger, protocol style, or meaningful identity."""
     return [(s, d["lines"], d["frontmatter"].get("name", s), d["category"])
             for s, d in skills.items()
-            if not d["has_triggers"] and not d["is_protocol"]]
+            if not _has_identity(d)]
 
 
 def ecosystem_health_score(skills):
     total = len(skills)
     if total == 0:
         return 0
-    with_triggers = sum(1 for d in skills.values() if d["has_triggers"])
-    with_meta = sum(1 for d in skills.values() if d.get("meta_block"))
-    with_mentions = sum(1 for d in skills.values() if d["mentions"])
-    connected = sum(1 for d in skills.values() if d.get("referenced_by"))
+    desc_not_empty = sum(1 for d in skills.values() if d["frontmatter"].get("description", "").strip())
+    desc_substantive = sum(1 for d in skills.values()
+                           if len(d["frontmatter"].get("description", "").strip()) >= 20)
+    body_has_content = sum(1 for d in skills.values() if d.get("lines", 0) >= 20)
+    has_identity = sum(1 for d in skills.values() if _has_identity(d))
     score = (
-        (with_triggers / total) * 30 +
-        (with_meta / total) * 20 +
-        (with_mentions / total) * 20 +
-        (connected / total) * 30
+        (desc_not_empty / total) * 20 +
+        (desc_substantive / total) * 25 +
+        (body_has_content / total) * 15 +
+        (has_identity / total) * 40
     )
     return round(score, 1)
 
@@ -305,8 +372,13 @@ def render_full_report(skills):
     lines.append("=" * 60)
 
     total = len(skills)
-    with_triggers = sum(1 for d in skills.values() if d["has_triggers"])
-    with_meta = sum(1 for d in skills.values() if d.get("meta_block"))
+    desc_not_empty = sum(1 for d in skills.values() if d["frontmatter"].get("description", "").strip())
+    desc_substantive = sum(1 for d in skills.values()
+                           if len(d["frontmatter"].get("description", "").strip()) >= 20)
+    body_has_content = sum(1 for d in skills.values() if d.get("lines", 0) >= 20)
+    has_identity = sum(1 for d in skills.values() if _has_identity(d))
+    with_triggers = sum(1 for d in skills.values() if d["has_triggers"])  # keep for other uses
+    with_meta = sum(1 for d in skills.values() if d.get("meta_block"))  # keep for other uses
 
     lines.append(f"\n  📊 Ecosystem Composition:")
     lines.append(f"     🔵 Core hubs:    {len(core)} skill(s)")
@@ -316,10 +388,10 @@ def render_full_report(skills):
     lines.append(f"     ⚠️  Orphans:     {len(orphans)} skill(s)")
 
     lines.append(f"\n  📊 Health Breakdown:")
-    lines.append(f"     Trigger coverage:   {with_triggers}/{total} ({100*with_triggers//total}%)")
-    lines.append(f"     Metadata complete: {with_meta}/{total} ({100*with_meta//total}%)")
-    lines.append(f"     Cross-referencing: {sum(1 for d in skills.values() if d['mentions'])}/{total}")
-    lines.append(f"     Ecosystem nodes:   {sum(1 for d in skills.values() if d.get('referenced_by'))}/{total}")
+    lines.append(f"     Description present:  {desc_not_empty}/{total} ({100*desc_not_empty//total}%)")
+    lines.append(f"     Description quality: {desc_substantive}/{total} ({100*desc_substantive//total}%)")
+    lines.append(f"     Body content:        {body_has_content}/{total} ({100*body_has_content//total}%)")
+    lines.append(f"     Identity coverage:  {has_identity}/{total} ({100*has_identity//total}%)")
 
     # Core hubs
     lines.append(f"\n{'🔵 CORE HUB SKILLS (ref by 3+)':=^60}")
@@ -408,10 +480,10 @@ L = {
     "orphan_skills":        ("Orphan Skills",                "孤儿技能"),
     "delete_impact":        ("Delete Impact Analysis",       "删除影响分析"),
     "health_breakdown":     ("Health Breakdown",             "健康度明细"),
-    "trigger_cov":          ("Trigger Coverage",              "触发词覆盖率"),
-    "meta_complete":        ("Metadata Completeness",         "Metadata完整率"),
-    "cross_ref":            ("Cross-referencing",             "跨技能引用"),
-    "eco_nodes":            ("Ecosystem Nodes",               "生态节点数"),
+    "desc_present":         ("Description Present",          "Description存在"),
+    "desc_quality":         ("Description Quality",          "Description质量"),
+    "body_content":         ("Body Content",                  "Body内容"),
+    "identity_cov":         ("Identity Coverage",             "身份覆盖"),
     "referenced_by":        ("referenced by",                "被引用"),
     "references":           ("references",                   "外联引用"),
     "affected":             ("affected skill(s)",             "受影响技能"),
@@ -424,7 +496,7 @@ L = {
     "categories":           ("categories",                   "个功能类别"),
     "legend":               ("LEGEND",                       "图例"),
     "ecosystem_map":        ("Skill Ecosystem Map",         "技能生态地图"),
-    "health_note_en":       ("Health: triggersx30% + metadatax20% + cross-refx20% + cohesionx30%",  ""),
+    "health_note_en":       ("Health: content(60%) + identity(40%)",  ""),
     "health_note_zh":       ("", "健康分：触发词x30% + metadatax20% + 跨引用x20% + 内聚度x30%"),
     "orphan_note2_en":       ("Many use /protocol activation -- not broken, different design",         ""),
     "orphan_note2_zh":      ("", "许多孤儿使用/protocol激活风格 -- 非损坏，仅设计风格不同"),
@@ -458,10 +530,13 @@ def render_bilingual(skills, lang="EN"):
     lines.append("  [Health] " + l("health_score") + ": " + str(health) + "/100")
     lines.append("=" * W)
 
-    with_triggers = sum(1 for d in skills.values() if d["has_triggers"])
-    with_meta     = sum(1 for d in skills.values() if d.get("meta_block"))
-    with_mentions = sum(1 for d in skills.values() if d["mentions"])
-    eco_nodes     = sum(1 for d in skills.values() if d.get("referenced_by"))
+    desc_not_empty = sum(1 for d in skills.values() if d["frontmatter"].get("description", "").strip())
+    desc_substantive = sum(1 for d in skills.values()
+                           if len(d["frontmatter"].get("description", "").strip()) >= 20)
+    body_has_content = sum(1 for d in skills.values() if d.get("lines", 0) >= 20)
+    has_identity = sum(1 for d in skills.values() if _has_identity(d))
+    eco_nodes = sum(1 for d in skills.values() if d.get("referenced_by"))
+
 
     lines.append("")
     lines.append("  [Composition] " + l("composition") + ":")
@@ -473,15 +548,16 @@ def render_bilingual(skills, lang="EN"):
 
     lines.append("")
     lines.append("  [Health] " + l("health_breakdown") + ":")
-    lines.append("     " + l("trigger_cov") + ":   " + str(with_triggers) + "/" + str(total) + " (" + str(100*with_triggers//total) + "%)")
-    lines.append("     " + l("meta_complete") + ": " + str(with_meta) + "/" + str(total) + " (" + str(100*with_meta//total) + "%)")
-    lines.append("     " + l("cross_ref") + ":           " + str(with_mentions) + "/" + str(total))
+    lines.append("     " + l("desc_present") + ":  " + str(desc_not_empty) + "/" + str(total) + " (" + str(100*desc_not_empty//total) + "%)")
+    lines.append("     " + l("desc_quality") + ":  " + str(desc_substantive) + "/" + str(total) + " (" + str(100*desc_substantive//total) + "%)")
+    lines.append("     " + l("body_content") + ":   " + str(body_has_content) + "/" + str(total) + " (" + str(100*body_has_content//total) + "%)")
+    lines.append("     " + l("identity_cov") + ":   " + str(has_identity) + "/" + str(total) + " (" + str(100*has_identity//total) + "%)")
     lines.append("     " + l("eco_nodes") + ":             " + str(eco_nodes) + "/" + str(total))
 
     if lang == "EN":
-        lines.append("  * Health: triggersx30% + metadatax20% + cross-refx20% + cohesionx30%")
+        lines.append("  * Health: content(60%) + identity(40%)")
     else:
-        lines.append("  * 健康分：触发词x30% + metadatax20% + 跨引用x20% + 内聚度x30%")
+        lines.append("  * 健康分：内容完整性(60%) + 身份覆盖(40%)")
 
     # Core hubs
     hub_title = "[Core] " + l("core_hubs") + " (ref by 3+)"

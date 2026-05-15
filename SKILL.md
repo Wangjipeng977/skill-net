@@ -7,7 +7,7 @@ description: >
   skills without trigger conditions (orhpans).
 license: MIT
 metadata:
-  version: "3.0"
+  version: "3.1"
   category: skill-development
   author: wangjipeng
 ---

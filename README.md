@@ -1,7 +1,7 @@
 # skill-net
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-![Version](https://img.shields.io/badge/version-3.0.0-blue)
+![Version](https://img.shields.io/badge/version-3.1.0-blue)
 
 > Diagnose, map, and score your OpenClaw skill ecosystem — find orphans, trace dependencies, measure health.
 
