@@ -1,5 +1,7 @@
 # skill-net
 
+[中文版](./README_zh.md)
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 ![Version](https://img.shields.io/badge/version-3.1.0-blue)
 
